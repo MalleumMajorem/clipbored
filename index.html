@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Local Clipboard Manager</title>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script>
+    <style>
+        body { margin: 0; font-family: sans-serif; display: flex; height: 100vh; background-color: #1e1e1e; color: #d4d4d4; }
+        #left-panel { width: 35%; min-width: 350px; border-right: 1px solid #333; padding: 20px; background-color: #252526; overflow-y: auto; display: flex; flex-direction: column; }
+        #right-panel { flex-grow: 1; padding: 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; background-color: #1e1e1e; overflow: hidden; }
+        
+        .controls { display: flex; gap: 10px; margin-bottom: 10px; }
+        button.primary { flex-grow: 1; padding: 10px; background-color: #0e639c; color: white; border: none; cursor: pointer; font-size: 14px; border-radius: 4px; }
+        button.primary:hover { background-color: #1177bb; }
+        button.secondary { padding: 10px; background-color: #333; color: white; border: 1px solid #555; cursor: pointer; border-radius: 4px; }
+        button.secondary:hover { background-color: #444; }
+        
+        .status-text { font-size: 12px; color: #888; margin-bottom: 20px; display: block; border-bottom: 1px solid #444; padding-bottom: 10px; }
+        
+        ul { list-style-type: none; padding-left: 15px; min-height: 20px; margin-top: 5px; }
+        .list-group { border-left: 1px dashed #555; }
+        
+        /* Base List Item Styling */
+        li { padding: 6px 8px; margin-bottom: 4px; background-color: #333; border-radius: 4px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; border: 1px solid transparent; transition: background-color 0.1s; }
+        li > .node-content { display: flex; align-items: center; flex-grow: 1; cursor: grab; padding: 2px 0; }
+        li > .node-content:active { cursor: grabbing; }
+        li[data-type="item"]:hover { background-color: #3a3a3e; }
+        
+        /* Active Item Highlighting */
+        li.active-item { background-color: #2b3d4f; border: 1px solid #0e639c; }
+        
+        .node-name { pointer-events: none; flex-grow: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 10px; }
+        
+        /* Category Styling & Active Drop Zone State */
+        .category { background-color: #2d2d30; border-left: 3px solid #555; flex-direction: column; align-items: stretch; transition: all 0.2s; }
+        .category > .node-content { font-weight: bold; margin-bottom: 5px; cursor: pointer; }
+        .category.active { background-color: #3a3a3e; border-left: 3px solid #4daafc; }
+        
+        .sortable-ghost { opacity: 0.4; background-color: #0e639c; } 
+        .rename-input { flex-grow: 1; background: #1e1e1e; color: white; border: 1px solid #4daafc; padding: 4px; font-family: inherit; margin-right: 10px; }
+        
+        .icon-btn { background: none; border: none; color: #aaa; cursor: pointer; font-size: 14px; padding: 2px 5px; border-radius: 3px; }
+        .icon-btn:hover { background: #555; color: white; }
+        .action-group { display: flex; gap: 5px; }
+
+        #image-preview { max-width: 100%; max-height: 100%; box-shadow: 0px 4px 15px rgba(0,0,0,0.5); display: none; object-fit: contain; }
+    </style>
+</head>
+<body>
+
+    <div id="left-panel">
+        <div class="controls">
+            <button id="select-folder-btn" class="primary">Select Sync Folder</button>
+            <button id="add-list-btn" class="secondary" style="display:none;">+ New List</button>
+        </div>
+        <span class="status-text" id="status-msg">Waiting for folder selection...</span>
+        <ul id="tree-root" class="list-group"></ul> 
+    </div>
+
+    <div id="right-panel">
+        <img id="image-preview" alt="Preview" />
+    </div>
+
+    <script>
+        let directoryHandle;
+        let globalCounter = 0; 
+        let currentPreviewedFile = null; 
+
+        // --- 1. IndexedDB Persistence ---
+        const dbPromise = new Promise((resolve, reject) => {
+            const request = indexedDB.open('ClipboardAppDB', 1);
+            request.onupgradeneeded = (e) => e.target.result.createObjectStore('handles');
+            request.onsuccess = (e) => resolve(e.target.result);
+            request.onerror = () => reject("Failed to open DB");
+        });
+
+        async function saveHandle(handle) {
+            const db = await dbPromise;
+            db.transaction('handles', 'readwrite').objectStore('handles').put(handle, 'syncFolder');
+        }
+
+        async function loadHandle() {
+            const db = await dbPromise;
+            return new Promise((resolve) => {
+                const request = db.transaction('handles').objectStore('handles').get('syncFolder');
+                request.onsuccess = () => resolve(request.result);
+            });
+        }
+
+        async function verifyPermission(fileHandle) {
+            if ((await fileHandle.queryPermission({ mode: 'readwrite' })) === 'granted') return true;
+            if ((await fileHandle.requestPermission({ mode: 'readwrite' })) === 'granted') return true;
+            return false;
+        }
+
+        // --- 2. Data Formatting & Saving ---
+        function sanitizeName(name) {
+            return name.replace(/[<>:"\/\\|?*\x00-\x1F]/g, '').trim() || "Unnamed";
+        }
+
+        function generateFileName(catName, itemName, id) {
+            return `${sanitizeName(catName)}_-_${sanitizeName(itemName)}_-_${id}.png`;
+        }
+
+        function buildTreeData(ulElement) {
+            const data = [];
+            for (let li of ulElement.children) {
+                const node = {
+                    type: li.dataset.type,
+                    name: li.querySelector('.node-name').textContent
+                };
+                if (node.type === 'item') {
+                    node.id = li.dataset.id;
+                    node.filename = li.dataset.filename;
+                } else {
+                    node.children = buildTreeData(li.querySelector('ul'));
+                }
+                data.push(node);
+            }
+            return data;
+        }
+
+        async function saveTreeToDisk() {
+            if (!directoryHandle) return;
+            const treeData = buildTreeData(document.getElementById('tree-root'));
+            try {
+                const fileHandle = await directoryHandle.getFileHandle('tree.json', { create: true });
+                const writable = await fileHandle.createWritable();
+                await writable.write(JSON.stringify(treeData, null, 2));
+                await writable.close();
+            } catch (error) { console.error("Error saving tree:", error); }
+        }
+
+        // --- 3. UI Generation & Events ---
+        
+        function setActiveCategory(categoryLi) {
+            document.querySelectorAll('.category').forEach(el => el.classList.remove('active'));
+            if (categoryLi) categoryLi.classList.add('active');
+        }
+
+        function setActiveItem(itemLi) {
+            document.querySelectorAll('li[data-type="item"]').forEach(el => el.classList.remove('active-item'));
+            if (itemLi) itemLi.classList.add('active-item');
+        }
+
+        function makeListSortable(ulElement) {
+            new Sortable(ulElement, {
+                group: 'nested',
+                animation: 150,
+                fallbackOnBody: true,
+                swapThreshold: 0.65,
+                filter: 'input', 
+                preventOnFilter: false, 
+                onEnd: async function (evt) {
+                    const itemLi = evt.item;
+                    if (itemLi.dataset.type === 'item') {
+                        const parentLi = itemLi.parentElement.closest('li.category');
+                        const newCatName = parentLi ? parentLi.querySelector('.node-name').textContent : "Root";
+                        const oldFileName = itemLi.dataset.filename;
+                        const itemName = itemLi.querySelector('.node-name').textContent;
+                        const newFileName = generateFileName(newCatName, itemName, itemLi.dataset.id);
+                        
+                        if (oldFileName !== newFileName) {
+                            try {
+                                const fileHandle = await directoryHandle.getFileHandle(oldFileName);
+                                await fileHandle.move(newFileName);
+                                itemLi.dataset.filename = newFileName;
+                                if(currentPreviewedFile === oldFileName) currentPreviewedFile = newFileName;
+                            } catch(e) { console.error("Move rename failed", e); }
+                        }
+                    }
+                    saveTreeToDisk(); 
+                }
+            });
+        }
+
+        function createNodeElement(name, isCategory, id = null, currentFileName = null) {
+            const li = document.createElement('li');
+            li.dataset.id = id;
+            li.dataset.type = isCategory ? 'category' : 'item';
+            if (currentFileName) li.dataset.filename = currentFileName;
+            if (isCategory) li.classList.add('category');
+
+            const contentDiv = document.createElement('div');
+            contentDiv.className = 'node-content';
+            
+            const textSpan = document.createElement('span');
+            textSpan.className = 'node-name';
+            textSpan.textContent = name;
+            contentDiv.appendChild(textSpan);
+
+            const actionsDiv = document.createElement('div');
+            actionsDiv.className = 'action-group';
+
+            // Category Click to set Active
+            if (isCategory) {
+                contentDiv.addEventListener('click', (e) => {
+                    if (e.target.tagName !== 'INPUT') {
+                        setActiveCategory(li);
+                    }
+                });
+            }
+
+            if (!isCategory) {
+                // Non-blocking Copy Button
+                const copyBtn = document.createElement('button');
+                copyBtn.innerHTML = '📋';
+                copyBtn.title = 'Copy to Clipboard';
+                copyBtn.className = 'icon-btn';
+                copyBtn.onclick = async (e) => {
+                    e.stopPropagation();
+                    try {
+                        const fileHandle = await directoryHandle.getFileHandle(li.dataset.filename);
+                        const file = await fileHandle.getFile();
+                        await navigator.clipboard.write([new ClipboardItem({ [file.type]: file })]);
+                        
+                        // Visual feedback swap
+                        const originalText = copyBtn.innerHTML;
+                        copyBtn.innerHTML = '✅';
+                        setTimeout(() => copyBtn.innerHTML = originalText, 1500);
+                        
+                    } catch (err) { console.error('Failed to copy', err); }
+                };
+                actionsDiv.appendChild(copyBtn);
+
+                // Preview Image & Set Active States on Click
+                contentDiv.addEventListener('click', async (e) => {
+                    if (e.target.tagName === 'INPUT') return;
+                    try {
+                        const fileHandle = await directoryHandle.getFileHandle(li.dataset.filename);
+                        const file = await fileHandle.getFile();
+                        document.getElementById('image-preview').src = URL.createObjectURL(file);
+                        document.getElementById('image-preview').style.display = 'block';
+                        currentPreviewedFile = li.dataset.filename;
+                        
+                        // Update UI Highlighting
+                        setActiveItem(li);
+                        const parentCat = li.closest('.category');
+                        if (parentCat) setActiveCategory(parentCat);
+
+                    } catch(e) { console.error("Preview failed", e); }
+                });
+            }
+
+            // Delete Button Logic with Fallback Preview
+            const delBtn = document.createElement('button');
+            delBtn.innerHTML = '❌';
+            delBtn.title = 'Delete';
+            delBtn.className = 'icon-btn';
+            delBtn.onclick = async (e) => {
+                e.stopPropagation();
+                if (isCategory) {
+                    if (!confirm(`Delete category "${name}" and ALL items inside it?`)) return;
+                    
+                    const isPreviewInside = Array.from(li.querySelectorAll('li[data-type="item"]')).some(item => item.dataset.filename === currentPreviewedFile);
+                    if (isPreviewInside) {
+                        document.getElementById('image-preview').style.display = 'none';
+                        currentPreviewedFile = null;
+                        setActiveItem(null);
+                    }
+
+                    const items = li.querySelectorAll('li[data-type="item"]');
+                    for (let item of items) {
+                        try { await directoryHandle.removeEntry(item.dataset.filename); } catch(err){}
+                    }
+                } else {
+                    try { await directoryHandle.removeEntry(li.dataset.filename); } catch(err){}
+                    
+                    if (currentPreviewedFile === li.dataset.filename) {
+                        let sibling = li.nextElementSibling;
+                        while(sibling && sibling.dataset.type !== 'item') sibling = sibling.nextElementSibling;
+                        
+                        if (!sibling) {
+                            sibling = li.previousElementSibling;
+                            while(sibling && sibling.dataset.type !== 'item') sibling = sibling.previousElementSibling;
+                        }
+
+                        if (sibling) {
+                            sibling.querySelector('.node-content').click(); 
+                        } else {
+                            document.getElementById('image-preview').style.display = 'none';
+                            currentPreviewedFile = null;
+                            setActiveItem(null);
+                        }
+                    }
+                }
+                li.remove();
+                saveTreeToDisk();
+            };
+            actionsDiv.appendChild(delBtn);
+            contentDiv.appendChild(actionsDiv);
+            li.appendChild(contentDiv);
+
+            // Double Click Rename Logic
+            contentDiv.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                const currentName = textSpan.textContent;
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.value = currentName;
+                input.className = 'rename-input';
+                
+                contentDiv.insertBefore(input, textSpan);
+                textSpan.style.display = 'none';
+                actionsDiv.style.display = 'none'; 
+                input.focus();
+
+                const saveRename = async () => {
+                    const newName = sanitizeName(input.value);
+                    textSpan.textContent = newName;
+                    textSpan.style.display = '';
+                    actionsDiv.style.display = 'flex';
+                    input.remove();
+
+                    if (!isCategory && directoryHandle && li.dataset.filename) {
+                        try {
+                            const oldFile = li.dataset.filename;
+                            const parentLi = li.closest('li.category');
+                            const catName = parentLi ? parentLi.querySelector('.node-name').textContent : "Root";
+                            const newFile = generateFileName(catName, newName, li.dataset.id);
+                            
+                            const fileHandle = await directoryHandle.getFileHandle(oldFile);
+                            await fileHandle.move(newFile);
+                            li.dataset.filename = newFile;
+                            if(currentPreviewedFile === oldFile) currentPreviewedFile = newFile;
+                        } catch (err) { console.error("File rename failed:", err); }
+                    } else if (isCategory && directoryHandle) {
+                        const childItems = li.querySelector('ul').querySelectorAll(':scope > li[data-type="item"]');
+                        for (let child of childItems) {
+                            try {
+                                const oldFile = child.dataset.filename;
+                                const childName = child.querySelector('.node-name').textContent;
+                                const newFile = generateFileName(newName, childName, child.dataset.id);
+                                
+                                const fileHandle = await directoryHandle.getFileHandle(oldFile);
+                                await fileHandle.move(newFile);
+                                child.dataset.filename = newFile;
+                                if(currentPreviewedFile === oldFile) currentPreviewedFile = newFile;
+                            } catch(err) { console.error("Child file rename failed:", err); }
+                        }
+                    }
+                    saveTreeToDisk();
+                };
+
+                input.addEventListener('blur', saveRename);
+                input.addEventListener('keydown', (evt) => { if (evt.key === 'Enter') input.blur(); });
+            });
+
+            if (isCategory) {
+                const nestedUl = document.createElement('ul');
+                nestedUl.classList.add('list-group');
+                makeListSortable(nestedUl);
+                li.appendChild(nestedUl);
+            }
+
+            return li;
+        }
+
+        // --- 4. Loading State ---
+        function renderTree(dataArray, parentUl) {
+            for (let node of dataArray) {
+                const li = createNodeElement(node.name, node.type === 'category', node.id, node.filename);
+                parentUl.appendChild(li);
+                
+                if (node.type === 'item') {
+                    globalCounter = Math.max(globalCounter, parseInt(node.id)); 
+                } else if (node.children) {
+                    renderTree(node.children, li.querySelector('ul'));
+                }
+            }
+        }
+
+        async function initializeFolder() {
+            document.getElementById('select-folder-btn').textContent = "Change Folder";
+            document.getElementById('add-list-btn').style.display = "block";
+            document.getElementById('status-msg').innerHTML = `Linked to: <b>${directoryHandle.name}</b><br><br>Click an item or category to make it active, then Ctrl+V to paste.`;
+            
+            const treeRoot = document.getElementById('tree-root');
+            treeRoot.innerHTML = '';
+            makeListSortable(treeRoot);
+            globalCounter = 0;
+
+            try {
+                const fileHandle = await directoryHandle.getFileHandle('tree.json');
+                const file = await fileHandle.getFile();
+                const text = await file.text();
+                const treeData = JSON.parse(text);
+                renderTree(treeData, treeRoot);
+                
+                const firstCat = document.querySelector('.category');
+                if (firstCat) setActiveCategory(firstCat);
+                
+            } catch (error) {
+                const defaultCat = createNodeElement("Default List", true);
+                treeRoot.appendChild(defaultCat);
+                setActiveCategory(defaultCat);
+                saveTreeToDisk();
+            }
+        }
+
+        // --- 5. Event Listeners ---
+        window.addEventListener('DOMContentLoaded', async () => {
+            const savedHandle = await loadHandle();
+            if (savedHandle && await verifyPermission(savedHandle)) {
+                directoryHandle = savedHandle;
+                initializeFolder();
+            }
+        });
+
+        document.getElementById('select-folder-btn').addEventListener('click', async () => {
+            try {
+                directoryHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+                await saveHandle(directoryHandle);
+                initializeFolder();
+            } catch (e) { console.log("Cancelled."); }
+        });
+
+        document.getElementById('add-list-btn').addEventListener('click', () => {
+            const newList = createNodeElement("New List", true);
+            document.getElementById('tree-root').appendChild(newList);
+            setActiveCategory(newList); 
+            saveTreeToDisk();
+        });
+
+        window.addEventListener('paste', async (event) => {
+            if (!directoryHandle) return;
+            const clipboardItems = event.clipboardData.items;
+            
+            for (let item of clipboardItems) {
+                if (item.type.startsWith('image/')) {
+                    const blob = item.getAsFile();
+                    globalCounter++; 
+                    
+                    const targetCategoryLi = document.querySelector('.category.active') || document.querySelector('.category');
+                    const catName = targetCategoryLi ? targetCategoryLi.querySelector('.node-name').textContent : "Root";
+                    const itemName = "Pasted Image";
+                    const filename = generateFileName(catName, itemName, globalCounter);
+
+                    try {
+                        const fileHandle = await directoryHandle.getFileHandle(filename, { create: true });
+                        const writable = await fileHandle.createWritable();
+                        await writable.write(blob);
+                        await writable.close();
+
+                        const imageUrl = URL.createObjectURL(blob);
+                        const imgEl = document.getElementById('image-preview');
+                        imgEl.src = imageUrl;
+                        imgEl.style.display = 'block';
+                        currentPreviewedFile = filename;
+
+                        const newItem = createNodeElement(itemName, false, globalCounter, filename);
+                        if (targetCategoryLi) {
+                            targetCategoryLi.querySelector('ul').appendChild(newItem);
+                        } else {
+                            document.getElementById('tree-root').appendChild(newItem);
+                        }
+                        
+                        // Set the newly pasted item as active
+                        setActiveItem(newItem);
+                        
+                        saveTreeToDisk();
+                    } catch (error) { console.error("Failed to save:", error); }
+                }
+            }
+        });
+    </script>
+</body>
+</html>
